@@ -52,7 +52,10 @@ enum Provider: String, CaseIterable {
 /// instead of uploading a finished clip. OpenAI-only — OpenRouter has no
 /// realtime endpoint.
 let LIVE_MODEL = "gpt-live-transcribe"
-let LIVE_MODELS = ["gpt-live-transcribe", "gpt-realtime-2.1", "gpt-realtime-2.1-mini", "gpt-realtime-whisper", "gpt-4o-transcribe"]
+/// The transcription intent accepts ONLY transcription models — the socket
+/// rejects voice-agent models (gpt-realtime-2.1 etc.) with invalid_value, so
+/// they don't belong here no matter what the pricing page groups them with.
+let LIVE_MODELS = ["gpt-live-transcribe", "gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe", "gpt-realtime-whisper"]
 /// The realtime session speaks 24 kHz mono PCM16 both ways.
 let LIVE_SAMPLE_RATE: Double = 24000
 
