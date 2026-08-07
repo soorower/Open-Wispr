@@ -52,7 +52,7 @@ enum Provider: String, CaseIterable {
 /// instead of uploading a finished clip. OpenAI-only — OpenRouter has no
 /// realtime endpoint.
 let LIVE_MODEL = "gpt-live-transcribe"
-let LIVE_MODELS = ["gpt-live-transcribe", "gpt-realtime-translate", "gpt-realtime-whisper", "gpt-4o-transcribe"]
+let LIVE_MODELS = ["gpt-live-transcribe", "gpt-realtime-whisper", "gpt-4o-transcribe"]
 /// The realtime session speaks 24 kHz mono PCM16 both ways.
 let LIVE_SAMPLE_RATE: Double = 24000
 
