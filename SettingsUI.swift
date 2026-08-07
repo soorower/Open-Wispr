@@ -310,6 +310,19 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
     private var permissionRows: [String: StatusRow] = [:]
     private var permTimer: Timer?
 
+    private let providerPicker = NSSegmentedControl(
+        labels: Provider.allCases.map { $0.title },
+        trackingMode: .selectOne, target: nil, action: nil)
+    private let providerNote = Theme.dim("", 11)
+    private let keyLabel = Theme.line("", 11.5, .medium, .secondaryLabelColor)
+    private let modelHint = Theme.dim("", 11)
+    private let liveNote = Theme.dim("", 11)
+    private var liveRow: ToggleRow!
+    private var liveDivider: NSView!
+    /// Which provider's key is currently shown in the box — the save target,
+    /// pinned so a provider switch mid-edit can't write it to the wrong one.
+    private var keyFieldProvider: Provider = .openrouter
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         build()
@@ -320,12 +333,21 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         let header = makePaneHeader("General", "Your transcription key, the model, and how dictation behaves.")
 
         // --- Transcription
-        let transcription = Card("Transcription", "Audio goes to OpenRouter; the key is stored in ~/.config/openwispr/.env (chmod 600).")
+        let transcription = Card("Transcription", "Where your audio goes. The key is stored in ~/.config/openwispr/.env (chmod 600).")
 
-        keyField.placeholderString = "sk-or-v1-…"
+        providerPicker.selectedSegment = Provider.allCases.firstIndex(of: Config.shared.provider) ?? 0
+        providerPicker.segmentDistribution = .fillEqually
+        providerPicker.target = self
+        providerPicker.action = #selector(providerChanged)
+        providerPicker.translatesAutoresizingMaskIntoConstraints = false
+        providerPicker.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        transcription.add(Theme.line("Provider", 11.5, .medium, .secondaryLabelColor))
+        transcription.add(Theme.hstack([providerPicker, Theme.spacer()], spacing: 8))
+        transcription.add(providerNote)
+        transcription.addDivider()
+
         keyField.font = .systemFont(ofSize: 12.5)
         keyField.bezelStyle = .roundedBezel
-        keyField.stringValue = Config.shared.env()["OPENROUTER_API_KEY"] ?? ""
         keyField.target = self
         keyField.action = #selector(saveKey)
         keyField.cell?.sendsActionOnEndEditing = true
@@ -333,8 +355,6 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         // An OpenRouter key is ~73 characters with no spaces, so revealing it in a
         // single-line field only ever shows "sk-or-v1-…". Wrap it by character
         // across as many lines as it needs.
-        keyPlain.placeholderString = "sk-or-v1-…"
-        keyPlain.stringValue = keyField.stringValue
         keyPlain.isHidden = true
         keyPlain.isEditable = true
         keyPlain.isSelectable = true
@@ -385,13 +405,11 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         let keyRow = Theme.hstack([keySlot, revealButton, save, verify], spacing: 6)
         keySlot.setContentHuggingPriority(.init(1), for: .horizontal)
 
-        transcription.add(Theme.line("OpenRouter API key", 11.5, .medium, .secondaryLabelColor))
+        transcription.add(keyLabel)
         transcription.add(keyRow)
         transcription.add(keyStatus)
         transcription.addDivider()
 
-        modelBox.addItems(withObjectValues: SUGGESTED_MODELS)
-        modelBox.stringValue = Config.shared.model
         modelBox.font = .systemFont(ofSize: 12.5)
         modelBox.completes = true
         modelBox.target = self
@@ -406,7 +424,21 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         transcription.add(Theme.line("Model", 11.5, .medium, .secondaryLabelColor))
         transcription.add(Theme.hstack([modelBox, Theme.spacer()], spacing: 8))
         transcription.add(modelStatus)
-        transcription.add(Theme.dim("Must be a model that accepts audio on OpenRouter's transcriptions endpoint — an image or chat-only model will fail.", 11))
+        transcription.add(modelHint)
+
+        // Live streaming is OpenAI-only, so this whole block collapses out of the
+        // card on OpenRouter rather than sitting there as a dead switch.
+        liveDivider = Theme.divider()
+        transcription.add(liveDivider)
+        liveRow = ToggleRow("Live streaming",
+                            "Stream the audio as you talk and watch the words land, instead of uploading the clip at the end.",
+                            isOn: Config.shared.live) { [weak self] on in
+            Config.shared.setFlag("LIVE", on)
+            Config.shared.log("Live streaming toggled: \(on)")
+            self?.refreshProviderUI()
+        }
+        transcription.add(liveRow)
+        transcription.add(liveNote)
 
         // --- Behaviour
         let behaviour = Card("Dictation")
@@ -458,13 +490,70 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
 
         let scroll = makeCardScroll([header, transcription, behaviour, permissions], topInset: 46)
         scroll.fill(self, inset: 0)
+        refreshProviderUI()
+    }
+
+    @objc private func providerChanged() {
+        let picked = Provider.allCases[max(0, providerPicker.selectedSegment)]
+        guard picked != Config.shared.provider else { return }
+        // Commit anything typed but not yet saved — against the OLD provider,
+        // which is still what keyFieldProvider points at.
+        saveKey()
+        Config.shared.provider = picked
+        Config.shared.log("Provider set to \(picked.rawValue)")
+        refreshProviderUI()
+    }
+
+    /// Every provider-dependent label, field and list in one place — called on
+    /// launch, on a provider switch, and when live mode is toggled.
+    private func refreshProviderUI() {
+        let provider = Config.shared.provider
+        let live = Config.shared.liveEnabled
+
+        providerPicker.selectedSegment = Provider.allCases.firstIndex(of: provider) ?? 0
+        providerNote.stringValue = provider == .openai
+            ? "Straight to OpenAI. Needed for models OpenRouter hasn't picked up yet, and the only way to stream live."
+            : "One key, many vendors' models. No live streaming — OpenRouter has no realtime endpoint."
+
+        // Each provider's key is kept in its own line in .env, so switching back
+        // and forth never makes you paste a key twice.
+        keyLabel.stringValue = "\(provider.title) API key"
+        keyField.placeholderString = provider.keyPlaceholder
+        keyPlain.placeholderString = provider.keyPlaceholder
+        let saved = Config.shared.env()[provider.keyVar] ?? ""
+        keyFieldProvider = provider
+        keyField.stringValue = saved
+        keyPlain.stringValue = saved
+
+        modelBox.removeAllItems()
+        modelBox.addItems(withObjectValues: live ? LIVE_MODELS : provider.suggestedModels)
+        modelBox.stringValue = Config.shared.model
+        // The live models are missing from this list until streaming is on, which
+        // looks like they're unavailable — say so rather than let it read as a bug.
+        if live {
+            modelHint.stringValue = "Realtime models only — these run on the streaming socket, not the upload endpoint."
+        } else if provider == .openai {
+            modelHint.stringValue = "Upload models only. Turn on Live streaming below to use \(LIVE_MODEL) — "
+                + "it's streaming-only, so it can't transcribe an uploaded clip."
+        } else {
+            modelHint.stringValue = "Must be a model that accepts audio on \(provider.title)'s transcriptions endpoint — an image or chat-only model will fail."
+        }
+
+        let showLive = provider == .openai
+        liveRow.isHidden = !showLive
+        liveDivider.isHidden = !showLive
+        liveNote.isHidden = !showLive || !Config.shared.live
+        liveNote.stringValue = "Deltas arrive over a WebSocket while you speak, so releasing fn pastes almost instantly. "
+            + "\(LIVE_MODEL) bills $0.017 per minute of audio."
+
         refreshKeyStatus()
+        refreshModelStatus()
+        updateKeySlotHeight()
     }
 
     override func paneAppeared() {
         refreshPermissions()
-        refreshKeyStatus()
-        refreshModelStatus()
+        refreshProviderUI()
         permTimer?.invalidate()
         permTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refreshPermissions()
@@ -497,7 +586,7 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
             keyStatus.stringValue = "Key set (…\(tail))."
             keyStatus.textColor = .secondaryLabelColor
         } else {
-            keyStatus.stringValue = "No key yet — dictation is disabled until you add one."
+            keyStatus.stringValue = "No \(Config.shared.provider.title) key yet — dictation is disabled until you add one."
             keyStatus.textColor = .systemOrange
         }
     }
@@ -554,11 +643,35 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         saveKey()
     }
 
+    /// Two rules here, both learned the hard way:
+    ///
+    /// 1. Save against the provider the field was POPULATED for, never whatever
+    ///    is selected right now. Clicking the provider picker ends editing, which
+    ///    fires this, and AppKit does not guarantee that happens before the
+    ///    picker's own action — so `Config.shared.provider` may already be the
+    ///    new one while the box still holds the old provider's text.
+    /// 2. An empty box NEVER deletes a key. Switching providers repopulates the
+    ///    field, so blank overwhelmingly means "nothing typed here", not "throw
+    ///    away my credential". Losing a key you can't get back is far worse than
+    ///    making deletion a manual edit.
     @objc private func saveKey() {
+        let target = keyFieldProvider
         let value = (keyPlain.isHidden ? keyField.stringValue : keyPlain.stringValue)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        Config.shared.set("OPENROUTER_API_KEY", value)
-        Config.shared.log("API key updated from settings")
+
+        guard !value.isEmpty else {
+            if Config.shared.apiKey(for: target) != nil {
+                keyStatus.stringValue = "Box is empty — your saved \(target.title) key is untouched."
+                keyStatus.textColor = .secondaryLabelColor
+            } else {
+                refreshKeyStatus()
+            }
+            return
+        }
+        guard value != Config.shared.apiKey(for: target) else { refreshKeyStatus(); return }
+
+        Config.shared.set(target.keyVar, value)
+        Config.shared.log("\(target.title) API key updated from settings")
         refreshKeyStatus()
     }
 
@@ -577,7 +690,9 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         let m = modelBox.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !m.isEmpty else { refreshModelStatus(); return }
         guard m != Config.shared.model else { refreshModelStatus(); return }
-        Config.shared.set("MODEL", m)
+        // Live mode keeps its own model slot — a realtime-only name must not leak
+        // into the batch setting and break uploads when streaming goes back off.
+        Config.shared.set(Config.shared.liveEnabled ? "LIVE_MODEL" : Config.shared.provider.modelVar, m)
         Config.shared.log("Model set to \(m)")
         refreshModelStatus()
     }
@@ -599,9 +714,12 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         }
     }
 
-    /// Cheap key check — OpenRouter's /key endpoint reports the label and usage.
+    /// Cheap key check. OpenRouter's /key endpoint reports the label and usage;
+    /// OpenAI has no equivalent, so we list the models — which doubles as the
+    /// answer to "does my account actually have the live model yet?".
     @objc private func verifyKey() {
         saveKey()
+        let provider = Config.shared.provider
         guard let key = Config.shared.apiKey else {
             keyStatus.stringValue = "Add a key first."
             keyStatus.textColor = .systemOrange
@@ -609,14 +727,14 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
         }
         keyStatus.stringValue = "Checking…"
         keyStatus.textColor = .secondaryLabelColor
-        var req = URLRequest(url: URL(string: OPENROUTER_KEY_URL)!)
+        var req = URLRequest(url: URL(string: provider == .openai ? OPENAI_KEY_URL : OPENROUTER_KEY_URL)!)
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 20
         URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if let err = err {
-                    self.keyStatus.stringValue = "Couldn't reach OpenRouter — \(err.localizedDescription)"
+                    self.keyStatus.stringValue = "Couldn't reach \(provider.title) — \(err.localizedDescription)"
                     self.keyStatus.textColor = .systemOrange
                     return
                 }
@@ -625,6 +743,26 @@ final class GeneralPane: PaneView, NSComboBoxDelegate {
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
                     self.keyStatus.stringValue = "Unexpected reply (HTTP \(code))."
                     self.keyStatus.textColor = .systemOrange
+                    return
+                }
+                if provider == .openai {
+                    if let models = json["data"] as? [[String: Any]] {
+                        let ids = Set(models.compactMap { $0["id"] as? String })
+                        let wanted = Config.shared.model
+                        if ids.contains(wanted) {
+                            self.keyStatus.stringValue = "✓ Valid — \(ids.count) models, including \(wanted)."
+                            self.keyStatus.textColor = Theme.teal
+                        } else {
+                            // Not fatal: /v1/models has been known to omit newly
+                            // launched names that still work when you call them.
+                            self.keyStatus.stringValue = "✓ Key works (\(ids.count) models), but “\(wanted)” isn't listed — try a dictation to be sure."
+                            self.keyStatus.textColor = .systemOrange
+                        }
+                    } else {
+                        let msg = (json["error"] as? [String: Any])?["message"] as? String ?? "rejected (HTTP \(code))"
+                        self.keyStatus.stringValue = "✕ \(msg)"
+                        self.keyStatus.textColor = .systemOrange
+                    }
                     return
                 }
                 if let d = json["data"] as? [String: Any] {
@@ -680,11 +818,11 @@ final class AboutPane: PaneView {
         }
 
         let privacy = Card("Privacy")
-        privacy.add(Theme.label("Recordings go straight to OpenRouter for transcription and are not kept on disk beyond the current clip. Transcripts, replacements and logs stay in ~/.config/openwispr.\n\nWhen “Learn my corrections” is on, the app reads the text of the field you just dictated into — via the same Accessibility permission it needs to paste — purely to spot the word you changed. Only the word pair is saved.\n\nChrome and Electron apps hide their text from Accessibility until an assistive client asks, so for those Open-Wispr sets “AXEnhancedUserInterface” on the app you're dictating into — the same switch VoiceOver uses — once per app, per session. Switching “Learn my corrections” off stops that entirely.", 12))
+        privacy.add(Theme.label("Recordings go straight to whichever provider you picked — OpenRouter or OpenAI — for transcription, and are not kept on disk beyond the current clip. In live streaming mode nothing is written to disk at all: the audio goes over the socket as you speak. Transcripts, replacements and logs stay in ~/.config/openwispr.\n\nWhen “Learn my corrections” is on, the app reads the text of the field you just dictated into — via the same Accessibility permission it needs to paste — purely to spot the word you changed. Only the word pair is saved.\n\nChrome and Electron apps hide their text from Accessibility until an assistive client asks, so for those Open-Wispr sets “AXEnhancedUserInterface” on the app you're dictating into — the same switch VoiceOver uses — once per app, per session. Switching “Learn my corrections” off stops that entirely.", 12))
 
         let links = Card("Links")
-        let keysButton = Theme.plainButton("OpenRouter API keys", target: self, action: #selector(openKeys))
-        let creditsButton = Theme.plainButton("OpenRouter credits", target: self, action: #selector(openCredits))
+        let keysButton = Theme.plainButton("API keys", target: self, action: #selector(openKeys))
+        let creditsButton = Theme.plainButton("Usage & credits", target: self, action: #selector(openCredits))
         let configButton = Theme.plainButton("Open config folder", target: self, action: #selector(openConfig))
         links.add(Theme.hstack([keysButton, creditsButton, configButton, Theme.spacer()], spacing: 8))
 
@@ -692,7 +830,16 @@ final class AboutPane: PaneView {
         scroll.fill(self, inset: 0)
     }
 
-    @objc private func openKeys() { NSWorkspace.shared.open(URL(string: "https://openrouter.ai/settings/keys")!) }
-    @objc private func openCredits() { NSWorkspace.shared.open(URL(string: "https://openrouter.ai/credits")!) }
+    /// Follows the provider you're actually using, so these never send you to the
+    /// wrong dashboard.
+    @objc private func openKeys() {
+        NSWorkspace.shared.open(URL(string: Config.shared.provider.keysPage)!)
+    }
+
+    @objc private func openCredits() {
+        let url = Config.shared.provider == .openai
+            ? "https://platform.openai.com/usage" : "https://openrouter.ai/credits"
+        NSWorkspace.shared.open(URL(string: url)!)
+    }
     @objc private func openConfig() { NSWorkspace.shared.open(Config.shared.dir) }
 }

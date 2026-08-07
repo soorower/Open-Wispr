@@ -5,6 +5,12 @@ import Cocoa
 let DEFAULT_MODEL = "openai/gpt-4o-mini-transcribe"
 let OPENROUTER_URL = "https://openrouter.ai/api/v1/audio/transcriptions"
 let OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+let OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions"
+let OPENAI_KEY_URL = "https://api.openai.com/v1/models"
+/// Transcription sessions take `?intent=transcription`. Passing the model as a
+/// `?model=` query param instead is rejected with `invalid_model` — that param is
+/// for voice-agent models only, so the model goes in the session.update payload.
+let OPENAI_REALTIME_URL = "wss://api.openai.com/v1/realtime?intent=transcription"
 /// Single source of truth is Info.plist — the DMG is named from the same value.
 let APP_VERSION = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.1"
 
@@ -15,6 +21,40 @@ let SUGGESTED_MODELS = [
     "openai/whisper-1",
     "mistralai/voxtral-mini-transcribe",
 ]
+
+/// Where the audio goes. OpenRouter is one key for many vendors' models; OpenAI
+/// direct is the only way to reach models OpenRouter hasn't picked up yet, and
+/// the only one with a realtime streaming endpoint.
+enum Provider: String, CaseIterable {
+    case openrouter, openai
+
+    var title: String { self == .openrouter ? "OpenRouter" : "OpenAI" }
+    var keyVar: String { self == .openrouter ? "OPENROUTER_API_KEY" : "OPENAI_API_KEY" }
+    var modelVar: String { self == .openrouter ? "MODEL" : "OPENAI_MODEL" }
+    var keyPlaceholder: String { self == .openrouter ? "sk-or-v1-…" : "sk-…" }
+    var transcriptionsURL: String { self == .openrouter ? OPENROUTER_URL : OPENAI_URL }
+    var keysPage: String {
+        self == .openrouter ? "https://openrouter.ai/settings/keys"
+                            : "https://platform.openai.com/api-keys"
+    }
+
+    var defaultModel: String { self == .openrouter ? DEFAULT_MODEL : "gpt-4o-mini-transcribe" }
+
+    var suggestedModels: [String] {
+        self == .openrouter ? SUGGESTED_MODELS
+                            : ["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"]
+    }
+}
+
+// MARK: - Live (streaming) transcription
+
+/// Streams transcript deltas over a WebSocket while you are still talking,
+/// instead of uploading a finished clip. OpenAI-only — OpenRouter has no
+/// realtime endpoint.
+let LIVE_MODEL = "gpt-live-transcribe"
+let LIVE_MODELS = ["gpt-live-transcribe", "gpt-realtime-translate", "gpt-realtime-whisper", "gpt-4o-transcribe"]
+/// The realtime session speaks 24 kHz mono PCM16 both ways.
+let LIVE_SAMPLE_RATE: Double = 24000
 
 extension Notification.Name {
     static let owSettingsChanged = Notification.Name("openwispr.settingsChanged")
@@ -120,17 +160,45 @@ final class Config {
 
     func setFlag(_ key: String, _ on: Bool) { set(key, on ? "1" : "0") }
 
-    var apiKey: String? {
-        if let k = ProcessInfo.processInfo.environment["OPENROUTER_API_KEY"], !k.isEmpty { return k }
-        if let k = env()["OPENROUTER_API_KEY"], !k.isEmpty { return k }
+    /// Existing installs have no PROVIDER line and an OpenRouter key, so the
+    /// default has to stay OpenRouter — an upgrade must not silently repoint
+    /// their audio at a provider they have no key for.
+    var provider: Provider {
+        get {
+            let raw = ProcessInfo.processInfo.environment["OPENWISPR_PROVIDER"] ?? env()["PROVIDER"] ?? ""
+            return Provider(rawValue: raw.lowercased()) ?? .openrouter
+        }
+        set { set("PROVIDER", newValue.rawValue) }
+    }
+
+    func apiKey(for provider: Provider) -> String? {
+        if let k = ProcessInfo.processInfo.environment[provider.keyVar], !k.isEmpty { return k }
+        if let k = env()[provider.keyVar], !k.isEmpty { return k }
         return nil
     }
 
-    var model: String {
+    var apiKey: String? { apiKey(for: provider) }
+
+    /// Each provider keeps its own model, because the names aren't portable:
+    /// OpenRouter wants "openai/gpt-4o-transcribe", OpenAI wants "gpt-4o-transcribe".
+    /// Live mode gets its own slot again — those models only exist on the
+    /// realtime endpoint, so they'd break the batch path if they leaked into it.
+    func model(for provider: Provider, live: Bool = false) -> String {
         if let m = ProcessInfo.processInfo.environment["OPENWISPR_MODEL"], !m.isEmpty { return m }
-        if let m = env()["MODEL"], !m.isEmpty { return m }
-        return DEFAULT_MODEL
+        if live {
+            if let m = env()["LIVE_MODEL"], !m.isEmpty { return m }
+            return LIVE_MODEL
+        }
+        if let m = env()[provider.modelVar], !m.isEmpty { return m }
+        return provider.defaultModel
     }
+
+    var model: String { model(for: provider, live: liveEnabled) }
+
+    /// The realtime WebSocket path. Only OpenAI has one, so the toggle is inert
+    /// on OpenRouter rather than being a setting that silently does nothing.
+    var live: Bool { flag("LIVE", default: false) }
+    var liveEnabled: Bool { provider == .openai && live }
 
     var cleanup: Bool { flag("CLEANUP", default: true) }
     var autoLearn: Bool { flag("AUTOLEARN", default: true) }

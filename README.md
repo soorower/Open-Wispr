@@ -124,12 +124,41 @@ bar. When launchd starts it at login it stays quiet (`--background`).
 
 The eye button reveals the whole key, wrapped across as many lines as it needs.
 
-## Models
+## Providers and models
 
-Default: `openai/gpt-4o-mini-transcribe`. Any OpenRouter model that accepts audio
-on the transcriptions endpoint works — the model box suggests
-`microsoft/mai-transcribe-1.5`, `openai/gpt-4o-transcribe`, `openai/whisper-1`
-and `mistralai/voxtral-mini-transcribe`. Image- or chat-only models will fail.
+Pick a provider at the top of Settings → Transcription. Each keeps its own key
+and its own model, so switching back and forth never costs you a re-paste.
+
+- **OpenRouter** (default) — one key, many vendors' models. Default
+  `openai/gpt-4o-mini-transcribe`; the box also suggests
+  `microsoft/mai-transcribe-1.5`, `openai/gpt-4o-transcribe`, `openai/whisper-1`
+  and `mistralai/voxtral-mini-transcribe`.
+- **OpenAI** — straight to the source. Use this for models OpenRouter hasn't
+  picked up yet, and for live streaming. Default `gpt-4o-mini-transcribe`.
+
+Any model that accepts audio on the provider's transcriptions endpoint works.
+Image- or chat-only models will fail.
+
+## Live streaming (OpenAI only)
+
+Settings → Transcription → **Live streaming**. Instead of recording a clip and
+uploading it when you let go, the app opens a WebSocket the moment you press fn
+and streams 24 kHz audio as you talk. Transcript deltas come back in flight and
+show up in the HUD, so releasing fn pastes almost immediately instead of waiting
+out an upload.
+
+Default model `gpt-live-transcribe` — a streaming-only model that bills
+**$0.017 per minute** of audio. It lives on the realtime endpoint
+(`wss://api.openai.com/v1/realtime?intent=transcription`) and cannot be used for
+normal uploads, which is why live mode keeps its own model setting.
+
+Nothing is written to disk in this mode — the audio never becomes a file. Your
+replacement dictionary is sent along as keyword hints, so the words the model
+usually gets wrong come back right more often. Cleanup, the dictionary and
+auto-learn all still run on the final text exactly as before.
+
+If the socket drops mid-sentence, whatever was already transcribed is still
+pasted rather than thrown away.
 
 ## Word replacements
 
@@ -236,8 +265,13 @@ Written with the defaults below on first run, and editable from the settings
 window; the file is just where it lands.
 
 ```
+PROVIDER=openrouter              # openrouter (default) or openai
 OPENROUTER_API_KEY=sk-or-v1-…    # yours, added on first run — never shipped
-MODEL=openai/gpt-4o-transcribe   # optional override
+OPENAI_API_KEY=sk-…              # only needed when PROVIDER=openai
+MODEL=openai/gpt-4o-transcribe   # optional override, OpenRouter
+OPENAI_MODEL=gpt-4o-transcribe   # optional override, OpenAI
+LIVE=0                           # 1 = stream live over the realtime socket (OpenAI only)
+LIVE_MODEL=gpt-live-transcribe   # optional override, live mode only
 CLEANUP=1                        # 1 = remove fillers/stutters (default), 0 = off
 AUTOLEARN=1                      # 1 = learn words you fix after a paste (default)
 SOUNDS=1                         # 1 = start/stop/error sound cues (default)
@@ -247,13 +281,18 @@ Alongside it: `replacements.json` (your dictionary), `history.json` (last 200
 dictations), `openwispr.log`. *Launch at login* writes
 `~/Library/LaunchAgents/com.openwispr.app.plist` and takes effect next login.
 
-`OPENROUTER_API_KEY` and `OPENWISPR_MODEL` in the environment override the file.
+`OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `OPENWISPR_PROVIDER` and
+`OPENWISPR_MODEL` in the environment override the file.
 
 ## Testing the API without the app
 
 ```sh
-./test_api.sh   # uses `say` to synthesize speech, sends it through the same request the app makes
+./test_api.sh    # upload path: `say` synthesizes speech, sent as the app sends it
+./test_live.py   # live path: streams that audio over the realtime socket, prints deltas as they land
 ```
+
+`test_live.py` speaks the same protocol as the app, so it's the quickest way to
+tell whether a key has access to `gpt-live-transcribe`. Needs `pip3 install websockets`.
 
 ## Troubleshooting
 

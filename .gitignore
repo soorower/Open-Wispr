@@ -18,6 +18,7 @@ dist/
 *.mobileprovision
 
 # Scratch
+__pycache__/
 *.wav
 *.aiff
 .DS_Store

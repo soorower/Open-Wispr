@@ -1,8 +1,13 @@
 // Open-Wispr — local Wispr Flow alternative.
-// fn (hold or tap) -> record mic -> OpenRouter gpt-4o-mini-transcribe -> paste at cursor.
+// fn (hold or tap) -> record mic -> transcribe -> paste at cursor.
+//
+// Two ways to transcribe: upload the finished clip (OpenRouter or OpenAI), or
+// stream it live over OpenAI's realtime socket and watch the text arrive as you
+// speak. Both meet again in finishTranscription().
 //
 // This file is the menu-bar app itself. See also:
 //   Config.swift        settings/log/history on disk
+//   LiveTranscribe.swift  the streaming realtime path
 //   Replacements.swift  the "heard this -> type that" dictionary
 //   Corrections.swift   learns a replacement when you fix a word after a paste
 //   Theme.swift, SettingsUI.swift, SettingsPanes.swift   the settings window
@@ -319,6 +324,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var popup = TranscriptPopup()
     var state: AppState = .idle
     var recorder: AVAudioRecorder?
+    /// Non-nil only in live mode — it replaces `recorder` for that dictation.
+    var live: LiveTranscriber?
+    var liveStartedAt = Date()
     var fnMonitor: Any?
     var fnIsDown = false
     var fnPressedAt = Date.distantPast
@@ -716,6 +724,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Give a Chromium/Electron target the record+transcribe window to build its
         // accessibility tree, so we can see your edit once the text lands.
         if autoLearnEnabled { CorrectionWatcher.prepareFrontmostApp() }
+        // Live mode never touches the disk — it streams straight to the socket.
+        if Config.shared.liveEnabled {
+            startLiveRecording()
+            return
+        }
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatLinearPCM),
             AVSampleRateKey: 16000,
@@ -749,6 +762,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func stopAndTranscribe() {
+        if live != nil { stopLive(); return }
         guard state == .recording, let rec = recorder else { return }
         maxLenTimer?.invalidate()
         let duration = rec.currentTime
@@ -773,44 +787,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         log("Recording stopped (\(String(format: "%.1f", duration))s), transcribing")
 
         transcribe(fileURL: audioURL) { [weak self] result in
-            guard let self = self else { return }
-            self.state = .idle
-            self.stopAnim()
-            self.setStatusIcon("🎤")
-            self.toggleMenuItem.title = "Start Dictation"
-            switch result {
-            case .success(let text):
-                let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
-                if clean.isEmpty {
-                    self.pill.state = .idle
-                    self.hud.show("🤷 No speech detected", autohide: 1.2)
-                    self.log("Empty transcript")
-                } else {
-                    let cleaned = self.cleanTranscript(clean)
-                    // Your dictionary runs last so its exact spelling ("ReqKey") survives.
-                    let final = ReplacementStore.shared.apply(to: cleaned)
-                    self.lastTranscript = final
-                    if final != clean {
-                        self.log("Transcript raw (\(clean.count)): \(clean.prefix(160))")
-                        self.log("Transcript final (\(final.count)): \(final.prefix(160))")
-                    } else {
-                        self.log("Transcript (\(final.count) chars): \(final.prefix(160))")
-                    }
-                    HistoryStore.shared.add(text: final, seconds: duration, model: self.modelName())
-                    self.pasteText(final)
-                }
-            case .failure(let err):
-                self.pill.state = .idle
-                self.log("Transcription error: \(err.localizedDescription)")
-                self.hud.show("⚠️ \(err.localizedDescription)", autohide: 2.5)
-                self.playSound("Basso")
-            }
+            self?.finishTranscription(result, duration: duration)
         }
     }
 
-    // MARK: - OpenRouter transcription
+    /// The tail both paths share: clean it up, apply your dictionary, remember it,
+    /// paste it. Whether the words arrived in one upload or streamed in live makes
+    /// no difference from here on.
+    func finishTranscription(_ result: Result<String, Error>, duration: TimeInterval) {
+        state = .idle
+        stopAnim()
+        setStatusIcon("🎤")
+        toggleMenuItem.title = "Start Dictation"
+        switch result {
+        case .success(let text):
+            let clean = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if clean.isEmpty {
+                pill.state = .idle
+                hud.show("🤷 No speech detected", autohide: 1.2)
+                log("Empty transcript")
+            } else {
+                let cleaned = cleanTranscript(clean)
+                // Your dictionary runs last so its exact spelling ("ReqKey") survives.
+                let final = ReplacementStore.shared.apply(to: cleaned)
+                lastTranscript = final
+                if final != clean {
+                    log("Transcript raw (\(clean.count)): \(clean.prefix(160))")
+                    log("Transcript final (\(final.count)): \(final.prefix(160))")
+                } else {
+                    log("Transcript (\(final.count) chars): \(final.prefix(160))")
+                }
+                HistoryStore.shared.add(text: final, seconds: duration, model: modelName())
+                pasteText(final)
+            }
+        case .failure(let err):
+            pill.state = .idle
+            log("Transcription error: \(err.localizedDescription)")
+            hud.show("⚠️ \(err.localizedDescription)", autohide: 2.5)
+            playSound("Basso")
+        }
+    }
+
+    // MARK: - Live transcription
+
+    /// Same lifecycle as the file path — start, stop, hand the text to
+    /// finishTranscription — except the words arrive while you are still talking.
+    func startLiveRecording() {
+        guard let key = apiKey() else { return }
+        let model = Config.shared.model
+        let session = LiveTranscriber(model: model, key: key)
+        session.onLevel = { [weak self] level in self?.pill.view.level = level }
+        session.onText = { [weak self] text in self?.showLivePreview(text) }
+        session.onFinish = { [weak self] result in
+            guard let self = self, self.live != nil else { return }
+            self.live = nil
+            self.hud.hide()
+            self.finishTranscription(result, duration: Date().timeIntervalSince(self.liveStartedAt))
+        }
+        do {
+            try session.start()
+        } catch {
+            log("Live session failed to start: \(error.localizedDescription)")
+            hud.show("⚠️ \(error.localizedDescription)", autohide: 2.5)
+            playSound("Basso")
+            return
+        }
+        live = session
+        liveStartedAt = Date()
+        state = .recording
+        pill.state = .recording
+        startAnim()
+        setStatusIcon("🔴")
+        toggleMenuItem.title = "Stop & Transcribe"
+        playSound("Pop")
+        maxLenTimer = Timer.scheduledTimer(withTimeInterval: MAX_CLIP_SECONDS, repeats: false) { [weak self] _ in
+            self?.stopAndTranscribe()
+        }
+        log("Live session started (\(model))")
+    }
+
+    func stopLive() {
+        guard let session = live else { return }
+        maxLenTimer?.invalidate()
+        let duration = Date().timeIntervalSince(liveStartedAt)
+
+        if duration < MIN_CLIP_SECONDS {
+            live = nil
+            session.cancel()
+            hud.hide()
+            state = .idle
+            stopAnim()
+            pill.state = .idle
+            setStatusIcon("🎤")
+            toggleMenuItem.title = "Start Dictation"
+            log("Clip too short (\(String(format: "%.2f", duration))s), discarded")
+            return
+        }
+
+        state = .transcribing
+        pill.state = .transcribing
+        setStatusIcon("✨")
+        toggleMenuItem.title = "Transcribing…"
+        playSound("Tink")
+        log("Live recording stopped (\(String(format: "%.1f", duration))s), finalising")
+        // Most of the transcript is already in hand, so this usually returns in
+        // well under the grace period rather than the full upload round-trip.
+        session.finish()
+    }
+
+    /// The point of live mode: the words show up in the HUD as you say them.
+    /// Only the tail, so a long dictation doesn't grow a banner off-screen.
+    func showLivePreview(_ text: String) {
+        guard live != nil, !text.isEmpty else { return }
+        hud.show(text.count > 110 ? "…" + String(text.suffix(110)) : text)
+    }
+
+    // MARK: - Batch transcription (OpenRouter or OpenAI)
 
     func transcribe(fileURL: URL, completion: @escaping (Result<String, Error>) -> Void) {
+        let provider = Config.shared.provider
         func fail(_ msg: String) {
             completion(.failure(NSError(domain: "Open-Wispr", code: 2, userInfo: [NSLocalizedDescriptionKey: msg])))
         }
@@ -830,7 +925,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         body.append(audioData)
         body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
 
-        var req = URLRequest(url: URL(string: OPENROUTER_URL)!)
+        var req = URLRequest(url: URL(string: provider.transcriptionsURL)!)
         req.httpMethod = "POST"
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
@@ -842,7 +937,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 if let err = err { return fail(err.localizedDescription) }
                 guard let data = data,
                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                    return fail("Bad response from OpenRouter")
+                    return fail("Bad response from \(provider.title)")
                 }
                 if let apiErr = json["error"] as? [String: Any], let msg = apiErr["message"] as? String {
                     return fail(msg)
